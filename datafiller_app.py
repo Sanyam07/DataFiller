@@ -35,11 +35,9 @@ def main():
 
     print(f"Calculating {target}")
     filler = DataFiller(input_data, target, sparse_matrix=SPARSE_MATRIX)
-    filler.classify_fields()
-    filler.prepare_pipeline()
     filler.predict_target()
     filler.save_dataset(f"{filename}_OUTPUT_{filler.target}.xlsx")
-    print("Process complete\n%s" % filler.target_predicted.head())
+    print("Process complete\n%s" % filler.target_pred.head())
 
 
 def get_input_file():
