@@ -9,7 +9,7 @@
 
     @author: Francesco Baldisserri
     @email: fbaldisserri@gmail.com
-    @version: 1.4
+    @version: 0.9
 """
 
 import os
@@ -21,7 +21,7 @@ from tkinter.filedialog import askopenfilename
 from datafiller import DataFiller
 
 EXTENSIONS = ["xlsx", "xls", "csv"]
-SPARSE_MATRIX = False
+SPARSE_MATRIX = True
 
 
 def main():
@@ -31,6 +31,8 @@ def main():
         input_data = pd.read_csv(input_file, low_memory=SPARSE_MATRIX, dtype=str)
     elif file_extension in [".xls", ".xlsx"]:
         input_data = pd.read_excel(input_file, dtype=str)
+    else:
+        raise ValueError(f"File extension {file_extension} not recognized")
     target = get_target(input_data)
 
     print(f"Calculating {target}")

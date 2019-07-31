@@ -8,14 +8,16 @@
     version: 0.6
 """
 
+import math
 import copy
+import scipy
 import numpy as np
 import pandas as pd
-from sklearn.pipeline import make_pipeline
+import tensorflow as tf
 from sklearn.impute import SimpleImputer
+from sklearn.pipeline import make_pipeline
 from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import MinMaxScaler, OneHotEncoder
-from sklearn.neural_network import MLPClassifier, MLPRegressor
 
 INTEGERS_TYPES = ['int16', 'int32', 'int64']
 DECIMALS_TYPES = ['float16', 'float32', 'float64']
@@ -41,80 +43,70 @@ class DataFiller:
         self.features_data = input_data.drop(target, axis=1)
         self.target_data = input_data[target]
         self.sparse = sparse_matrix
-        self.data_fields = {}
-        self._classify_fields()
-        self.pipeline = make_pipeline(
-            self._prepare_preprocessor(),
-            self._prepare_model()
-        )
-        self.target_encoder = None
-        self._prepare_target_encoder()
+        self.data_fields = classify_fields(self.input_data)
+        self.features_encoder = self.build_features_encoder()
+        self.target_encoder = self.build_target_encoder()
+        self.model = None
         self.target_pred = None
 
-    def _classify_fields(self):
-        """Classify the dataset fields by DataType class"""
-        for field_name in self.input_data.columns:
-            temp_values = self.input_data[field_name].dropna()
-            temp_values = temp_values.apply(pd.to_numeric, errors='ignore')
-            if len(temp_values.unique()) <= 1:  # ignore single or no value fields
-                self.data_fields[field_name] = 'ignore'
-            elif temp_values.dtype in DECIMALS_TYPES:
-                self.data_fields[field_name] = 'number'
-            elif len(temp_values.unique()) < len(temp_values) / 10:
-                self.data_fields[field_name] = 'label'
-            elif temp_values.dtype in INTEGERS_TYPES:
-                self.data_fields[field_name] = 'number'
-            else:
-                self.data_fields[field_name] = 'label'
-
-    def _prepare_preprocessor(self):
+    def build_features_encoder(self):
         """Prepare multi-feature processing pipeline"""
-        number_features = [f for f in self.features_data.columns
-                           if self.data_fields[f] == 'number']
-        number_transformer = make_pipeline(
-            SimpleImputer(strategy='median'),
-            MinMaxScaler()
-        )
-        label_features = [f for f in self.features_data.columns
-                          if self.data_fields[f] == 'label']
-        label_transformer = make_pipeline(
-            SimpleImputer(strategy='constant', fill_value='missing'),
-            OneHotEncoder(sparse=self.sparse, handle_unknown='ignore')
-        )
-        return ColumnTransformer([  # TODO: Make orthogonal
-            ('number', number_transformer, number_features),
-            ('label', label_transformer, label_features),
-        ])
+        data_types = set(self.data_fields.values())-set(['ignore'])
+        transformer = []
+        for t in data_types:
+            features_per_type = [feat for feat in self.features_data.columns
+                                 if self.data_fields[feat] == t]
+            transformer += [(t, get_feature_transformer(t), features_per_type)]
+        return ColumnTransformer(transformer)
 
-    def _prepare_target_encoder(self):
+    def build_target_encoder(self):
         """Set the target encoder based on its type"""
         target_type = self.data_fields[self.target]
-        if target_type == 'label':
-            self.target_encoder = OneHotEncoder(handle_unknown='ignore')
-        elif target_type == 'number':
-            self.target_encoder = MinMaxScaler()
-        else:
-            raise ValueError(f"Target type {target_type} not recognized")
+        return make_pipeline(get_field_encoder(target_type))
 
-    def _prepare_model(self):
-        target_type = self.data_fields[self.target]
-        if target_type == 'label':
-            model = MLPClassifier()
+    def build_keras_model(self, target_type, features_dim, target_dim, depth=1):
+        neurons = int(math.sqrt(features_dim+target_dim))
+        model = tf.keras.models.Sequential()
+        model.add(tf.keras.layers.Dense(neurons,
+                                        activation='relu',
+                                        input_dim=features_dim))
+        for d in range(1, depth):
+            model.add(tf.keras.layers.Dense(neurons, activation='relu'))
+        if target_type == 'label':  # TODO: Not orthogonal, create data_structure
+            model.add(tf.keras.layers.Dense(target_dim, activation="sigmoid"))
+            model.compile(optimizer='adam', loss='binary_crossentropy')
         elif target_type == 'number':
-            model = MLPRegressor()
+            model.add(tf.keras.layers.Dense(target_dim, activation="sigmoid"))
+            model.compile(optimizer='adam', loss='mean_squared_error')
         else:
             raise ValueError(f"Value {target_type} not recognized")
         return model
 
-    def predict_target(self):
+    def predict_target(self, min_improvement=10**-2, patience=3, epochs=100):
         """Trains a model and predict target values (after data encoding)"""
         features_train = self.features_data[self.target_data.notnull()]
         target_train = self.target_data[self.target_data.notnull()]
-        y_train = self.target_encoder.fit_transform(
-            target_train.values.reshape(-1,1)
+        x_train = self.features_encoder.fit_transform(
+            features_train
         )
-        self.pipeline.fit(features_train, y_train)
-        y_pred = self.pipeline.predict(self.features_data)
+        y_train = self.target_encoder.fit_transform(
+            target_train.values.reshape(-1,1),
+        )
+        self.model = self.build_keras_model(self.data_fields[self.target],
+                                            x_train.shape[1], y_train.shape[1],
+                                            depth=2)
+        calls = [tf.keras.callbacks.EarlyStopping(
+            monitor='loss', min_delta=min_improvement,
+            patience=patience, restore_best_weights=True)]
+        steps_for_epoch = 10
+        batch_size = math.ceil(x_train.shape[0]/ steps_for_epoch)
+        train_sequence = datafiller_sequence(x_train, y_train, batch_size=batch_size)
+        self.model.fit_generator(train_sequence, steps_per_epoch=steps_for_epoch,
+                                 verbose=2, callbacks=calls, epochs=epochs)
+
+        x_pred = self.features_encoder.transform(self.features_data)
+        pred_sequence = datafiller_sequence(x_pred)
+        y_pred = self.model.predict_generator(pred_sequence)
         self.target_pred = pd.DataFrame(
             self.target_encoder.inverse_transform(y_pred),
             index=self.target_data.index,
@@ -146,16 +138,69 @@ class DataFiller:
             output.to_csv(output_filename)
 
 
-class DenseTransformer():
-    def transform(self, X, y=None, **fit_params):
-        return X.todense()
+class datafiller_sequence(tf.keras.utils.Sequence):
+    def __init__(self, x, y=None, batch_size=32):
+        self.x, self.y = x, y
+        self.batch_size = batch_size
 
-    def fit_transform(self, X, y=None, **fit_params):
-        self.fit(X, y, **fit_params)
-        return self.transform(X)
+    def __len__(self):
+        return int(np.ceil(self.x.shape[0] / float(self.batch_size)))
 
-    def fit(self, X, y=None, **fit_params):
-        return self
+    def __getitem__(self, idx):
+        return self.__makebatch__(self.x, idx), self.__makebatch__(self.y, idx) \
+            if self.y is not None else self.__makebatch__(self.x, idx)
+
+    def __makebatch__(self, variable, idx):
+        batch = variable[idx * self.batch_size:(idx + 1) * self.batch_size]
+        if scipy.sparse.issparse(variable):
+            batch = batch.todense()
+        return batch
+
+
+def classify_fields(input_data):
+    """Classify the dataset fields by DataType class"""
+    data_fields = {}
+    for field_name in input_data.columns:
+        temp_values = input_data[field_name].dropna()
+        temp_values = temp_values.apply(pd.to_numeric, errors='ignore')
+        if len(temp_values.unique()) <= 1:  # ignore single or no value fields
+            data_fields[field_name] = 'ignore'
+        elif temp_values.dtype in DECIMALS_TYPES:
+            data_fields[field_name] = 'number'
+        elif len(temp_values.unique()) < len(temp_values) / 10:
+            data_fields[field_name] = 'label'
+        elif temp_values.dtype in INTEGERS_TYPES:
+            data_fields[field_name] = 'number'
+        else:
+            data_fields[field_name] = 'label'  # TODO: Implement TFIDF vectorizer
+    return data_fields
+
+
+def get_feature_transformer(field_type):
+    return make_pipeline(
+        get_field_imputer(field_type),
+        get_field_encoder(field_type)
+    )
+
+
+def get_field_imputer(field_type):
+    if field_type == 'number':
+        imputer = SimpleImputer(strategy='median')
+    elif field_type == 'label':
+        imputer = SimpleImputer(strategy='constant', fill_value='missing')
+    else:
+        raise ValueError(f"Field type {field_type} not recognized")
+    return imputer
+
+
+def get_field_encoder(field_type):
+    if field_type == 'number':
+        encoder = MinMaxScaler()
+    elif field_type == 'label':
+        encoder = OneHotEncoder(handle_unknown='ignore')
+    else:
+        raise ValueError(f"Field type {field_type} not recognized")
+    return encoder
 
 
 def color_targets(row, target_type, tolerance=0.1, color_new='#98FF99',
