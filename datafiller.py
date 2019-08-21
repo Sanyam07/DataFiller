@@ -13,14 +13,15 @@ import copy
 import scipy
 import numpy as np
 import pandas as pd
-import tensorflow as tf
-from sklearn.impute import SimpleImputer
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense
+from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras.utils import Sequence
 from sklearn.pipeline import make_pipeline
 from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import MinMaxScaler, OneHotEncoder
 
-INTEGERS_TYPES = ['int16', 'int32', 'int64']
-DECIMALS_TYPES = ['float16', 'float32', 'float64']
+import datatype as df
+
 TARGET_SUFFIX = '_NEW'
 
 
@@ -43,75 +44,77 @@ class DataFiller:
         self.features_data = input_data.drop(target, axis=1)
         self.target_data = input_data[target]
         self.sparse = sparse_matrix
-        self.data_fields = classify_fields(self.input_data)
+        self.data_types = df.classify_fields(self.input_data)
         self.features_encoder = self.build_features_encoder()
+        self.target_type = self.get_field_type(self.target)
         self.target_encoder = self.build_target_encoder()
         self.model = None
         self.target_pred = None
 
+    def get_field_type(self, field):
+        for _, type in self.data_types.items():
+            if field in type['fields']:
+                return type['datatype']
+
     def build_features_encoder(self):
         """Prepare multi-feature processing pipeline"""
-        data_types = set(self.data_fields.values())-set(['ignore'])
-        transformer = []
-        for t in data_types:
-            features_per_type = [feat for feat in self.features_data.columns
-                                 if self.data_fields[feat] == t]
-            transformer += [(t, get_feature_transformer(t), features_per_type)]
-        return ColumnTransformer(transformer)
+        transformers = []
+        for name, type in self.data_types.items():
+            if name is not 'ignore':
+                features = [f for f in type['fields'] if f != self.target]
+                transformers += [(name,
+                                  type['datatype'].get_feature_transformer(),
+                                  features)]
+        return ColumnTransformer(transformers)
 
     def build_target_encoder(self):
-        """Set the target encoder based on its type"""
-        target_type = self.data_fields[self.target]
-        return make_pipeline(get_field_encoder(target_type))
+        """Prepare the target encoder based on its type"""
+        return make_pipeline(self.target_type.get_target_transformer())
 
-    def build_keras_model(self, target_type, features_dim, target_dim, depth=1):
-        neurons = int(math.sqrt(features_dim+target_dim))
-        model = tf.keras.models.Sequential()
-        model.add(tf.keras.layers.Dense(neurons,
-                                        activation='relu',
-                                        input_dim=features_dim))
-        for d in range(1, depth):
-            model.add(tf.keras.layers.Dense(neurons, activation='relu'))
-        if target_type == 'label':  # TODO: Not orthogonal, create data_structure
-            model.add(tf.keras.layers.Dense(target_dim, activation="sigmoid"))
-            model.compile(optimizer='adam', loss='binary_crossentropy')
-        elif target_type == 'number':
-            model.add(tf.keras.layers.Dense(target_dim, activation="sigmoid"))
-            model.compile(optimizer='adam', loss='mean_squared_error')
-        else:
-            raise ValueError(f"Value {target_type} not recognized")
+    def build_model(self, target_type, features_dim, target_dim, depth=1):
+        """Prepare the training model"""
+        model = Sequential()
+        input_dim = features_dim
+        neurons_scaling_factor = (target_dim/features_dim)**(1/(depth+1))
+        for d in range(0, depth):
+            neurons = int(input_dim * neurons_scaling_factor)
+            model.add(Dense(neurons, activation='relu', input_dim=input_dim))
+            input_dim = neurons
+        model.add(Dense(target_dim, activation=target_type.activation))
+        model.compile(optimizer='adam',
+                      loss=target_type.loss,
+                      metrics=target_type.metrics)
         return model
 
-    def predict_target(self, min_improvement=10**-2, patience=3, epochs=100):
+    def predict_target(self):
         """Trains a model and predict target values (after data encoding)"""
-        features_train = self.features_data[self.target_data.notnull()]
-        target_train = self.target_data[self.target_data.notnull()]
-        x_train = self.features_encoder.fit_transform(
-            features_train
+        X = self.features_encoder.fit_transform(self.features_data)
+        Y = self.target_encoder.fit_transform(
+            self.target_data.values.reshape(-1, 1)
         )
-        y_train = self.target_encoder.fit_transform(
-            target_train.values.reshape(-1,1),
-        )
-        self.model = self.build_keras_model(self.data_fields[self.target],
-                                            x_train.shape[1], y_train.shape[1],
-                                            depth=2)
-        calls = [tf.keras.callbacks.EarlyStopping(
-            monitor='loss', min_delta=min_improvement,
-            patience=patience, restore_best_weights=True)]
-        steps_for_epoch = 10
-        batch_size = math.ceil(x_train.shape[0]/ steps_for_epoch)
-        train_sequence = datafiller_sequence(x_train, y_train, batch_size=batch_size)
-        self.model.fit_generator(train_sequence, steps_per_epoch=steps_for_epoch,
-                                 verbose=2, callbacks=calls, epochs=epochs)
+        training_rows = self.target_data.notnull()
+        X_train, Y_train = X[training_rows], Y[training_rows]
 
-        x_pred = self.features_encoder.transform(self.features_data)
-        pred_sequence = datafiller_sequence(x_pred)
-        y_pred = self.model.predict_generator(pred_sequence)
+        self.model = self.build_model(self.target_type,
+                                      X_train.shape[1], Y_train.shape[1],
+                                      depth=2)
+        self.train_model(X_train, Y_train)
+        pred_sequence = training_data_sequence(X)
+        Y_pred = self.model.predict_generator(pred_sequence)
         self.target_pred = pd.DataFrame(
-            self.target_encoder.inverse_transform(y_pred),
+            self.target_encoder.inverse_transform(Y_pred),
             index=self.target_data.index,
             columns=[self.target+TARGET_SUFFIX]
         )
+
+    def train_model(self, x, y, min_improvement=10**-2, patience=3, epochs=100):
+        calls = [EarlyStopping(monitor='loss', min_delta=min_improvement,
+                               patience=patience, restore_best_weights=True)]
+        steps_for_epoch = 10
+        batch_size = math.ceil(x.shape[0] / steps_for_epoch)
+        train_sequence = training_data_sequence(x, y, batch_size=batch_size)
+        self.model.fit_generator(train_sequence, steps_per_epoch=steps_for_epoch,
+                                 verbose=2, callbacks=calls, epochs=epochs)
 
     def save_dataset(self, output_filename):
         """
@@ -128,9 +131,8 @@ class DataFiller:
                 or output_filename.endswith(".xls"):
             index_slice = pd.IndexSlice[[self.target,
                                          self.target + TARGET_SUFFIX]]
-            target_type = self.data_fields[self.target]
             styler = output.style.apply(color_targets, axis=1,
-                                        target_type=target_type,
+                                        target_type=self.target_type,
                                         subset=index_slice)
             styler.to_excel(output_filename, sheet_name='DataFiller Output',
                             index=False, freeze_panes=(1, 1))
@@ -138,7 +140,7 @@ class DataFiller:
             output.to_csv(output_filename)
 
 
-class datafiller_sequence(tf.keras.utils.Sequence):
+class training_data_sequence(Sequence):
     def __init__(self, x, y=None, batch_size=32):
         self.x, self.y = x, y
         self.batch_size = batch_size
@@ -157,52 +159,7 @@ class datafiller_sequence(tf.keras.utils.Sequence):
         return batch
 
 
-def classify_fields(input_data):
-    """Classify the dataset fields by DataType class"""
-    data_fields = {}
-    for field_name in input_data.columns:
-        temp_values = input_data[field_name].dropna()
-        temp_values = temp_values.apply(pd.to_numeric, errors='ignore')
-        if len(temp_values.unique()) <= 1:  # ignore single or no value fields
-            data_fields[field_name] = 'ignore'
-        elif temp_values.dtype in DECIMALS_TYPES:
-            data_fields[field_name] = 'number'
-        elif len(temp_values.unique()) < len(temp_values) / 10:
-            data_fields[field_name] = 'label'
-        elif temp_values.dtype in INTEGERS_TYPES:
-            data_fields[field_name] = 'number'
-        else:
-            data_fields[field_name] = 'label'  # TODO: Implement TFIDF vectorizer
-    return data_fields
-
-
-def get_feature_transformer(field_type):
-    return make_pipeline(
-        get_field_imputer(field_type),
-        get_field_encoder(field_type)
-    )
-
-
-def get_field_imputer(field_type):
-    if field_type == 'number':
-        imputer = SimpleImputer(strategy='median')
-    elif field_type == 'label':
-        imputer = SimpleImputer(strategy='constant', fill_value='missing')
-    else:
-        raise ValueError(f"Field type {field_type} not recognized")
-    return imputer
-
-
-def get_field_encoder(field_type):
-    if field_type == 'number':
-        encoder = MinMaxScaler()
-    elif field_type == 'label':
-        encoder = OneHotEncoder(handle_unknown='ignore')
-    else:
-        raise ValueError(f"Field type {field_type} not recognized")
-    return encoder
-
-
+# TODO: Move function to datatype class
 def color_targets(row, target_type, tolerance=0.1, color_new='#98FF99',
                   color_different='#FF9999', color_match='transparent'):
     """
@@ -219,14 +176,14 @@ def color_targets(row, target_type, tolerance=0.1, color_new='#98FF99',
     old_value = row[0]
     if old_value is np.NAN:  # TODO: Breakdown, first color NAN then different
         color = color_new
-    elif target_type == 'number':  # TODO: Not orthogonal, use Datatype or move there
+    elif target_type.name == 'number':  # TODO: Not orthogonal, use Datatype or move there
         new_value = np.float(row[1])
         if abs(old_value - new_value) < \
                 tolerance * abs(old_value + new_value) / 2:
             color = color_match
         else:
             color = color_different
-    elif target_type == 'label':
+    elif target_type.name in ['label','phrase']:
         new_value = row[1]
         if old_value == new_value:
             color = color_match

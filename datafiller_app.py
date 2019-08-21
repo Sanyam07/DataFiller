@@ -33,7 +33,7 @@ def main():
         input_data = pd.read_excel(input_file, dtype=str)
     else:
         raise ValueError(f"File extension {file_extension} not recognized")
-    target = get_target(input_data)
+    target = get_target_name(input_data)
 
     print(f"Calculating {target}")
     filler = DataFiller(input_data, target, sparse_matrix=SPARSE_MATRIX)
@@ -59,7 +59,7 @@ def get_input_file():
     return input_path
 
 
-def get_target(input_data):
+def get_target_name(input_data):
     """
     Read parameters and input data
 
