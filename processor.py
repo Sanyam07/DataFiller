@@ -53,10 +53,10 @@ for request in requests:
             raw_data = pd.read_excel(conf.UPLOAD_FOLDER + input_file)
         # TODO: Restructure for filler refactoring
         filler = dt.DataFiller(raw_data, target, sparse_matrix=True)
-        filler.classify_fields()
+        filler._classify_fields()
         filler.encode_fields()
         filler.predict_target()
-        print("Process complete\n%s" % filler.target_predicted.head())
+        print("Process complete\n%s" % filler.target_pred.head())
         output_file = conf.PROCESSED_FOLDER + filename + ".xlsx"
         filler.save_dataset(output_file)
         os.remove(conf.UPLOAD_FOLDER + input_file)

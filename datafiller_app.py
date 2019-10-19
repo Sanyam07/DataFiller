@@ -20,43 +20,40 @@ from tkinter.filedialog import askopenfilename
 
 from datafiller import DataFiller
 
-EXTENSIONS = ["xlsx", "xls", "csv"]
-SPARSE_MATRIX = True
+FILE_EXTENSIONS = ["xlsx", "xls", "csv"]
 
 
 def main():
     input_file = get_input_file()
+    input_data = read_input_file(input_file)
+    target = get_target_name(input_data)
+    print(f"Calculating {target}")
+    filler = DataFiller(input_data, target)
+    predictions = filler.predict_target()
+    output_filename = os.path.splitext(input_file)[0]
+    filler.save_dataset(f"{output_filename}_OUTPUT_{target}.xlsx", predictions)
+    print("Process complete\n%s" % predictions.head())
+
+
+def get_input_file():
+    """ Get source filename from arguments or through graphical selector """
+    master = tk.Tk()
+    input_path = get_argument("-i") if has_argument("-i") \
+        else select_file(master, FILE_EXTENSIONS)
+    master.destroy()
+    return input_path
+
+
+def read_input_file(input_file):
+    """ Read input file from CSV, XLS or XLSX and return Dataframe """
     filename, file_extension = os.path.splitext(input_file)
     if file_extension in [".csv"]:
-        input_data = pd.read_csv(input_file, low_memory=SPARSE_MATRIX, dtype=str)
+        input_data = pd.read_csv(input_file, dtype=str)
     elif file_extension in [".xls", ".xlsx"]:
         input_data = pd.read_excel(input_file, dtype=str)
     else:
         raise ValueError(f"File extension {file_extension} not recognized")
-    target = get_target_name(input_data)
-
-    print(f"Calculating {target}")
-    filler = DataFiller(input_data, target, sparse_matrix=SPARSE_MATRIX)
-    filler.predict_target()
-    filler.save_dataset(f"{filename}_OUTPUT_{filler.target}.xlsx")
-    print("Process complete\n%s" % filler.target_pred.head())
-
-
-def get_input_file():
-    """
-    Get source filename from arguments or through graphical selector
-
-    :return: Input filename
-    """
-    master= tk.Tk()
-    if "-i" in sys.argv:
-        input_path = sys.argv[sys.argv.index("-i") + 1]
-    else:
-        filetypes = [(e.upper() + " files", "*." + e) for e in EXTENSIONS]
-        input_path = askopenfilename(title="Select input file",
-                                     filetypes=filetypes, parent=master)
-    master.destroy()
-    return input_path
+    return input_data
 
 
 def get_target_name(input_data):
@@ -67,10 +64,8 @@ def get_target_name(input_data):
     :return: Dataset, Target columns and filename
     """
     master = tk.Tk()
-    if "-t" in sys.argv:
-        target = sys.argv[sys.argv.index("-t") + 1]
-    else:
-        target = select_target(tuple(input_data.columns.values), master)
+    target = get_argument("-t") if has_argument("-t") \
+        else select_target(tuple(input_data.columns.values), master)
     master.destroy()
     return target
 
@@ -90,6 +85,21 @@ def select_target(fields, master):
     tk.Button(master, text="Select", command=master.quit).pack()
     tk.mainloop()
     return selector.get()
+
+
+def has_argument(argument):
+    return argument in sys.argv
+
+
+def get_argument(argument):
+    return sys.argv[sys.argv.index(argument) + 1]
+
+
+def select_file(master, extensions):
+    file_types = [(e.upper() + " files", "*." + e) for e in extensions]
+    return askopenfilename(title="Select input file",
+                           filetypes=file_types,
+                           parent=master)
 
 
 if __name__ == '__main__':
